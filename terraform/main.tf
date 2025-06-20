@@ -4,48 +4,32 @@ data "aws_caller_identity" "current" {}
 
 ## S3 Bucket for Cost Reports
 resource "aws_s3_bucket" "cost_reports" {
-  bucket = "cost-reports-${data.aws_caller_identity.current.account_id}"  
-
-  lifecycle_rule {
-    id      = "archive"
-    enabled = true
-
-    transition {
-      days          = 30
-      storage_class = "STANDARD_IA"
-    }
-
-    transition {
-      days          = 90
-      storage_class = "GLACIER"
-    }
-  }  
-
+  bucket = "cost-reports-${data.aws_caller_identity.current.account_id}"
   tags = {
     Name        = "Cost and Usage Reports"
     Environment = "Production"
   }
 }
 
-## S3 Bucket for Glue Catalog
-resource "aws_s3_bucket" "glue_catalog_cost_reports" {
-  bucket = "glue-catalog-cost-reports-${data.aws_caller_identity.current.account_id}"  
-
-  lifecycle_rule {
-    id      = "archive"
-    enabled = true
-
+resource "aws_s3_bucket_lifecycle_configuration" "cost_reports_lifecycle" {
+  bucket = aws_s3_bucket.cost_reports.id
+  rule {
+    id = "archive-old-reports"
+    status = "Enabled"
     transition {
       days          = 30
       storage_class = "STANDARD_IA"
     }
-
     transition {
       days          = 90
       storage_class = "GLACIER"
     }
   }
+}
 
+## S3 Bucket for Glue Catalog
+resource "aws_s3_bucket" "glue_catalog_cost_reports" {
+  bucket = "glue-catalog-cost-reports-${data.aws_caller_identity.current.account_id}"
   tags = {
     Name        = "Cost and Usage Reports"
     Environment = "Production"
