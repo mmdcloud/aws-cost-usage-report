@@ -5,6 +5,7 @@ data "aws_caller_identity" "current" {}
 ## S3 Bucket for Cost Reports
 resource "aws_s3_bucket" "cost_reports" {
   bucket = "cost-reports-${data.aws_caller_identity.current.account_id}"
+  force_destroy = true
   tags = {
     Name        = "Cost and Usage Reports"
     Environment = "Production"
@@ -14,7 +15,7 @@ resource "aws_s3_bucket" "cost_reports" {
 resource "aws_s3_bucket_lifecycle_configuration" "cost_reports_lifecycle" {
   bucket = aws_s3_bucket.cost_reports.id
   rule {
-    id = "archive-old-reports"
+    id     = "archive-old-reports"
     status = "Enabled"
     transition {
       days          = 30
@@ -30,6 +31,7 @@ resource "aws_s3_bucket_lifecycle_configuration" "cost_reports_lifecycle" {
 ## S3 Bucket for Glue Catalog
 resource "aws_s3_bucket" "glue_catalog_cost_reports" {
   bucket = "glue-catalog-cost-reports-${data.aws_caller_identity.current.account_id}"
+  force_destroy = true
   tags = {
     Name        = "Cost and Usage Reports"
     Environment = "Production"
@@ -58,7 +60,7 @@ resource "aws_s3_bucket_policy" "cost_reports" {
         Principal = {
           Service = "billingreports.amazonaws.com"
         },
-        Action = "s3:PutObject",
+        Action   = "s3:PutObject",
         Resource = "${aws_s3_bucket.cost_reports.arn}/*"
       }
     ]
@@ -87,7 +89,7 @@ resource "aws_athena_workgroup" "cost_analysis" {
   name = "cost-analysis"
 
   configuration {
-    enforce_workgroup_configuration = true
+    enforce_workgroup_configuration    = true
     publish_cloudwatch_metrics_enabled = true
 
     result_configuration {
