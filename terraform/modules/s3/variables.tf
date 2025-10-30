@@ -37,3 +37,26 @@ variable "bucket_notification" {
     lambda_function = []
   }
 }
+variable "block_public_acls" {
+  default = false
+}
+variable "block_public_policy" {
+  default = false
+}
+variable "ignore_public_acls" {
+  default = false
+}
+variable "restrict_public_buckets" {
+  default = false
+}
+# variable "lifecycle_policies" {
+#   type = list(object({
+#     id     = string
+#     status = string
+#     prefix = string
+#     tags   = map(string)
+#     expiration_days = number
+#     noncurrent_version_expiration_days = number
+#   }))
+#   default = []
+# }

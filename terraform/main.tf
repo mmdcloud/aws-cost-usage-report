@@ -1,19 +1,64 @@
-## Data Sources
+# -------------------------------------------------------------------------------
+# Data Sources
+# -------------------------------------------------------------------------------
 data "aws_caller_identity" "current" {}
 
-
-## S3 Bucket for Cost Reports
-resource "aws_s3_bucket" "cost_reports" {
-  bucket = "cost-reports-${data.aws_caller_identity.current.account_id}"
+# -------------------------------------------------------------------------------
+# S3 Bucket for Cost Reports
+# -------------------------------------------------------------------------------
+module "cost_reports" {
+  source             = "./modules/s3"
+  bucket_name        = "cost-reports-${data.aws_caller_identity.current.account_id}"
+  objects            = []
+  versioning_enabled = "Enabled"
+  cors = [
+    {
+      allowed_headers = ["*"]
+      allowed_methods = ["GET"]
+      allowed_origins = ["*"]
+      max_age_seconds = 3000
+    },
+    {
+      allowed_headers = ["*"]
+      allowed_methods = ["PUT"]
+      allowed_origins = ["*"]
+      max_age_seconds = 3000
+    }
+  ]
+  bucket_policy = jsonencode({
+    "Version" : "2012-10-17",
+    "Id" : "PolicyForBillingReports",
+    "Statement" : [
+      {
+        "Sid" : "AllowBillingReportsServiceGetObject",
+        "Effect" : "Allow",
+        "Principal" : {
+          "Service" : "billingreports.amazonaws.com"
+        },
+        "Action" : [
+          "s3:GetBucketAcl",
+          "s3:GetBucketPolicy"
+        ],
+        "Resource" : "${module.cost_reports.arn}"
+      },
+      {
+        "Sid" : "AllowBillingReportsServicePutObject",
+        "Effect" : "Allow",
+        "Principal" : {
+          "Service" : "billingreports.amazonaws.com"
+        },
+        "Action" : [
+          "s3:PutObject",
+        ],
+        "Resource" : "${module.cost_reports.arn}/*"
+      }
+    ]
+  })
   force_destroy = true
-  tags = {
-    Name        = "Cost and Usage Reports"
-    Environment = "Production"
-  }
 }
 
 resource "aws_s3_bucket_lifecycle_configuration" "cost_reports_lifecycle" {
-  bucket = aws_s3_bucket.cost_reports.id
+  bucket = module.cost_reports.bucket
   rule {
     id     = "archive-old-reports"
     status = "Enabled"
@@ -28,73 +73,118 @@ resource "aws_s3_bucket_lifecycle_configuration" "cost_reports_lifecycle" {
   }
 }
 
-## S3 Bucket for Glue Catalog
-resource "aws_s3_bucket" "glue_catalog_cost_reports" {
-  bucket = "glue-catalog-cost-reports-${data.aws_caller_identity.current.account_id}"
-  force_destroy = true
-  tags = {
-    Name        = "Cost and Usage Reports"
-    Environment = "Production"
-  }
+# -------------------------------------------------------------------------------
+# S3 bucket for Athena Query Results
+# -------------------------------------------------------------------------------
+module "athena_query_results" {
+  source        = "./modules/s3"
+  bucket_name   = "athena-query-results-${data.aws_caller_identity.current.account_id}"
+  objects       = []
+  bucket_policy = ""
+  cors = [
+    {
+      allowed_headers = ["*"]
+      allowed_methods = ["GET"]
+      allowed_origins = ["*"]
+      max_age_seconds = 3000
+    }
+  ]
+  versioning_enabled = "Enabled"
+  force_destroy      = true
 }
 
-resource "aws_s3_bucket_policy" "cost_reports" {
-  bucket = aws_s3_bucket.cost_reports.id
-
-  policy = jsonencode({
-    Version = "2012-10-17",
+# -----------------------------------------------------------------------------------------
+# Glue Configuration
+# -----------------------------------------------------------------------------------------
+resource "aws_iam_role" "glue_crawler_role" {
+  name = "glue-crawler-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
     Statement = [
       {
-        Effect = "Allow",
+        Effect = "Allow"
         Principal = {
-          Service = "billingreports.amazonaws.com"
-        },
-        Action = [
-          "s3:GetBucketAcl",
-          "s3:GetBucketPolicy"
-        ],
-        Resource = aws_s3_bucket.cost_reports.arn
-      },
-      {
-        Effect = "Allow",
-        Principal = {
-          Service = "billingreports.amazonaws.com"
-        },
-        Action   = "s3:PutObject",
-        Resource = "${aws_s3_bucket.cost_reports.arn}/*"
+          Service = "glue.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
       }
     ]
   })
 }
 
-## Cost and Usage Report Definition
+resource "aws_iam_role_policy_attachment" "glue_service_policy" {
+  role       = aws_iam_role.glue_crawler_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+}
+
+resource "aws_iam_role_policy" "s3_access_policy" {
+  role = aws_iam_role.glue_crawler_role.id
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket"
+        ],
+        Resource = [
+          "${module.cost_reports.arn}",
+          "${module.cost_reports.arn}/*"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_glue_catalog_database" "database" {
+  name        = var.glue_database_name
+  description = var.glue_database_name
+}
+
+resource "aws_glue_catalog_table" "table" {
+  name          = var.glue_table_name
+  database_name = aws_glue_catalog_database.database.name
+}
+
+resource "aws_glue_crawler" "crawler" {
+  database_name = aws_glue_catalog_database.database.name
+  name          = var.glue_crawler_name
+  role          = aws_iam_role.glue_crawler_role.arn
+  s3_target {
+    path = "s3://${module.cost_reports.bucket}"
+  }
+}
+
+# -------------------------------------------------------------------------------
+# Cost and Usage Report Definition
+# -------------------------------------------------------------------------------
 resource "aws_cur_report_definition" "cost_usage_report" {
   report_name                = "daily-cost-usage-report"
   time_unit                  = "DAILY"
-  format                     = "Parquet" # Recommended for Athena
+  format                     = "Parquet"
   compression                = "Parquet"
   additional_schema_elements = ["RESOURCES"]
-  s3_bucket                  = aws_s3_bucket.cost_reports.bucket
+  s3_bucket                  = module.cost_reports.bucket
   s3_prefix                  = "reports"
-  s3_region                  = aws_s3_bucket.cost_reports.region
+  s3_region                  = var.region
   additional_artifacts       = ["ATHENA"]
   refresh_closed_reports     = true
   report_versioning          = "OVERWRITE_REPORT"
 
-  depends_on = [aws_s3_bucket_policy.cost_reports]
+  depends_on = [module.cost_reports]
 }
 
-## Athena Workgroup for Querying Reports
+# -------------------------------------------------------------------------------
+# Athena Workgroup for Querying Reports
+# -------------------------------------------------------------------------------
 resource "aws_athena_workgroup" "cost_analysis" {
   name = "cost-analysis"
-
   configuration {
     enforce_workgroup_configuration    = true
     publish_cloudwatch_metrics_enabled = true
-
     result_configuration {
-      output_location = "s3://${aws_s3_bucket.cost_reports.bucket}/query_results/"
-
+      output_location = "s3://${module.athena_query_results.bucket}/"
       encryption_configuration {
         encryption_option = "SSE_S3"
       }
@@ -102,11 +192,12 @@ resource "aws_athena_workgroup" "cost_analysis" {
   }
 }
 
-## IAM Policy for Athena Access
+# -------------------------------------------------------------------------------
+# IAM Policy for Athena Access
+# -------------------------------------------------------------------------------
 resource "aws_iam_policy" "athena_cost_query" {
   name        = "AthenaCostQueryAccess"
   description = "Allows querying cost and usage reports"
-
   policy = jsonencode({
     Version = "2012-10-17",
     Statement = [
@@ -137,8 +228,8 @@ resource "aws_iam_policy" "athena_cost_query" {
           "s3:DeleteObject"
         ],
         Resource = [
-          aws_s3_bucket.cost_reports.arn,
-          "${aws_s3_bucket.cost_reports.arn}/*"
+          module.cost_reports.arn,
+          "${module.cost_reports.arn}/*"
         ]
       }
     ]
