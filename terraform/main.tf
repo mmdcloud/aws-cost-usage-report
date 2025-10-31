@@ -48,7 +48,7 @@ module "cost_reports" {
           "Service" : "billingreports.amazonaws.com"
         },
         "Action" : [
-          "s3:PutObject",
+          "s3:PutObject"
         ],
         "Resource" : "${module.cost_reports.arn}/*"
       }
@@ -69,6 +69,9 @@ resource "aws_s3_bucket_lifecycle_configuration" "cost_reports_lifecycle" {
     transition {
       days          = 90
       storage_class = "GLACIER"
+    }
+    expiration {
+      days = 365
     }
   }
 }
@@ -92,6 +95,18 @@ module "athena_query_results" {
   versioning_enabled = "Enabled"
   force_destroy      = true
 }
+
+resource "aws_s3_bucket_lifecycle_configuration" "athena_results_lifecycle" {
+  bucket = module.athena_query_results.bucket
+  rule {
+    id     = "cleanup-old-query-results"
+    status = "Enabled"
+    expiration {
+      days = 30
+    }
+  }
+}
+
 
 # -----------------------------------------------------------------------------------------
 # Glue Configuration
@@ -142,18 +157,24 @@ resource "aws_glue_catalog_database" "database" {
   description = var.glue_database_name
 }
 
-resource "aws_glue_catalog_table" "table" {
-  name          = var.glue_table_name
-  database_name = aws_glue_catalog_database.database.name
-}
-
 resource "aws_glue_crawler" "crawler" {
   database_name = aws_glue_catalog_database.database.name
   name          = var.glue_crawler_name
   role          = aws_iam_role.glue_crawler_role.arn
-  s3_target {
-    path = "s3://${module.cost_reports.bucket}"
+  schedule      = "cron(0 1 * * ? *)"
+  schema_change_policy {
+    delete_behavior = "LOG"
+    update_behavior = "UPDATE_IN_DATABASE"
   }
+  s3_target {
+    path = "s3://${module.cost_reports.bucket}/reports"
+  }
+  configuration = jsonencode({
+    Version = 1.0
+    CrawlerOutput = {
+      Partitions = { AddOrUpdateBehavior = "InheritFromTable" }
+    }
+  })
 }
 
 # -------------------------------------------------------------------------------
@@ -181,6 +202,7 @@ resource "aws_cur_report_definition" "cost_usage_report" {
 resource "aws_athena_workgroup" "cost_analysis" {
   name = "cost-analysis"
   configuration {
+    execution_role                     = aws_iam_role.athena_role.arn
     enforce_workgroup_configuration    = true
     publish_cloudwatch_metrics_enabled = true
     result_configuration {
@@ -204,16 +226,42 @@ resource "aws_iam_policy" "athena_cost_query" {
       {
         Effect = "Allow",
         Action = [
-          "athena:*",
+          "athena:StartQueryExecution",
+          "athena:GetQueryExecution",
+          "athena:GetQueryResults",
+          "athena:StopQueryExecution",
+          "athena:GetWorkGroup"
+        ],
+        Resource = [
+          "arn:aws:athena:${var.region}:${data.aws_caller_identity.current.account_id}:workgroup/${aws_athena_workgroup.cost_analysis.name}"
+        ]
+      },
+      {
+        Effect = "Allow",
+        Action = [
           "glue:GetDatabase",
           "glue:GetTable",
           "glue:GetTables",
           "glue:GetPartition",
-          "glue:GetPartitions",
-          "glue:CreateTable",
-          "glue:UpdateTable"
+          "glue:GetPartitions"
         ],
-        Resource = "*"
+        Resource = [
+          "arn:aws:glue:${var.region}:${data.aws_caller_identity.current.account_id}:catalog",
+          "arn:aws:glue:${var.region}:${data.aws_caller_identity.current.account_id}:database/${aws_glue_catalog_database.database.name}",
+          "arn:aws:glue:${var.region}:${data.aws_caller_identity.current.account_id}:table/${aws_glue_catalog_database.database.name}/*"
+        ]
+      },
+      {
+        Effect = "Allow",
+        Action = [
+          "s3:GetBucketLocation",
+          "s3:GetObject",
+          "s3:ListBucket"
+        ],
+        Resource = [
+          module.cost_reports.arn,
+          "${module.cost_reports.arn}/*"
+        ]
       },
       {
         Effect = "Allow",
@@ -228,10 +276,29 @@ resource "aws_iam_policy" "athena_cost_query" {
           "s3:DeleteObject"
         ],
         Resource = [
-          module.cost_reports.arn,
-          "${module.cost_reports.arn}/*"
+          module.athena_query_results.arn,
+          "${module.athena_query_results.arn}/*"
         ]
       }
     ]
   })
+}
+
+resource "aws_iam_role" "athena_role" {
+  name = "athena-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "athena.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "athena_role_policy" {
+  role       = aws_iam_role.athena_role.name
+  policy_arn = aws_iam_policy.athena_cost_query.arn
 }
