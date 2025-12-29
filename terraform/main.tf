@@ -302,3 +302,243 @@ resource "aws_iam_role_policy_attachment" "athena_role_policy" {
   role       = aws_iam_role.athena_role.name
   policy_arn = aws_iam_policy.athena_cost_query.arn
 }
+
+# -------------------------------------------------------------------------------
+# Budgets and Alerts
+# -------------------------------------------------------------------------------
+resource "aws_budgets_budget" "monthly_budget" {
+  name              = "monthly-total-budget"
+  budget_type       = "COST"
+  limit_amount      = var.monthly_budget_limit
+  limit_unit        = "USD"
+  time_unit         = "MONTHLY"
+  time_period_start = "2024-01-01_00:00"
+
+  notification {
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 80
+    threshold_type            = "PERCENTAGE"
+    notification_type         = "ACTUAL"
+    subscriber_email_addresses = [var.alert_email]
+    subscriber_sns_topic_arns  = [aws_sns_topic.cost_alerts.arn]
+  }
+
+  notification {
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 100
+    threshold_type            = "PERCENTAGE"
+    notification_type         = "ACTUAL"
+    subscriber_email_addresses = [var.alert_email]
+    subscriber_sns_topic_arns  = [aws_sns_topic.cost_alerts.arn]
+  }
+
+  notification {
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 90
+    threshold_type            = "PERCENTAGE"
+    notification_type         = "FORECASTED"
+    subscriber_email_addresses = [var.alert_email]
+  }
+}
+
+# Per-service budgets
+resource "aws_budgets_budget" "ec2_budget" {
+  name         = "ec2-monthly-budget"
+  budget_type  = "COST"
+  limit_amount = "5000"
+  limit_unit   = "USD"
+  time_unit    = "MONTHLY"
+
+  cost_filter {
+    name   = "Service"
+    values = ["Amazon Elastic Compute Cloud - Compute"]
+  }
+
+  notification {
+    comparison_operator       = "GREATER_THAN"
+    threshold                 = 80
+    threshold_type           = "PERCENTAGE"
+    notification_type        = "ACTUAL"
+    subscriber_sns_topic_arns = [aws_sns_topic.cost_alerts.arn]
+  }
+}
+
+# -------------------------------------------------------------------------------
+# Cost Allocation Tags
+# -------------------------------------------------------------------------------
+resource "aws_ce_cost_allocation_tag" "environment" {
+  tag_key = "Environment"
+  status  = "Active"
+}
+
+resource "aws_ce_cost_allocation_tag" "team" {
+  tag_key = "Team"
+  status  = "Active"
+}
+
+resource "aws_ce_cost_allocation_tag" "project" {
+  tag_key = "Project"
+  status  = "Active"
+}
+
+# Tag policy (if using AWS Organizations)
+resource "aws_organizations_policy" "tag_policy" {
+  name        = "required-tags-policy"
+  description = "Enforce required tags"
+  type        = "TAG_POLICY"
+
+  content = jsonencode({
+    tags = {
+      Environment = {
+        tag_key = {
+          @@assign = "Environment"
+        }
+        enforced_for = {
+          @@assign = ["ec2:instance", "rds:db", "s3:bucket"]
+        }
+      }
+      Team = {
+        tag_key = {
+          @@assign = "Team"
+        }
+      }
+    }
+  })
+}
+
+# Lambda to check tag compliance
+resource "aws_lambda_function" "tag_compliance_checker" {
+  filename      = "lambda/tag_compliance.zip"
+  function_name = "tag-compliance-checker"
+  role          = aws_iam_role.lambda_exec.arn
+  handler       = "index.handler"
+  runtime       = "python3.11"
+}
+
+# -------------------------------------------------------------------------------
+# DynamoDB Tables for Storing Cost Recommendations and Anomalies
+# -------------------------------------------------------------------------------
+resource "aws_dynamodb_table" "cost_recommendations" {
+  name           = "cost-recommendations"
+  billing_mode   = "PAY_PER_REQUEST"
+  hash_key       = "resource_id"
+  range_key      = "timestamp"
+
+  attribute {
+    name = "resource_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "timestamp"
+    type = "N"
+  }
+
+  attribute {
+    name = "status"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "StatusIndex"
+    hash_key        = "status"
+    range_key       = "timestamp"
+    projection_type = "ALL"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  tags = {
+    Name        = "cost-recommendations"
+    Environment = var.environment
+  }
+}
+
+resource "aws_dynamodb_table" "cost_anomalies" {
+  name           = "cost-anomalies"
+  billing_mode   = "PAY_PER_REQUEST"
+  hash_key       = "date"
+  range_key      = "service"
+
+  attribute {
+    name = "date"
+    type = "S"
+  }
+
+  attribute {
+    name = "service"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+}
+
+# -------------------------------------------------------------------------------
+# EventBridge Rules for Automated Tasks
+# -------------------------------------------------------------------------------
+# Daily cost analysis
+resource "aws_cloudwatch_event_rule" "daily_cost_analysis" {
+  name                = "daily-cost-analysis"
+  description         = "Trigger cost analysis daily"
+  schedule_expression = "cron(0 8 * * ? *)"  # 8 AM UTC daily
+}
+
+resource "aws_cloudwatch_event_target" "cost_analysis_lambda" {
+  rule      = aws_cloudwatch_event_rule.daily_cost_analysis.name
+  target_id = "CostAnalysisLambda"
+  arn       = aws_lambda_function.cost_analyzer.arn
+}
+
+resource "aws_lambda_permission" "allow_eventbridge" {
+  statement_id  = "AllowExecutionFromEventBridge"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.cost_analyzer.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.daily_cost_analysis.arn
+}
+
+# Weekly unused resources scan
+resource "aws_cloudwatch_event_rule" "weekly_unused_scan" {
+  name                = "weekly-unused-resources-scan"
+  description         = "Scan for unused resources weekly"
+  schedule_expression = "cron(0 9 ? * MON *)"  # Every Monday 9 AM
+}
+
+
+# -------------------------------------------------------------------------------
+# SNS Notifications for Cost Anomalies
+# -------------------------------------------------------------------------------
+resource "aws_sns_topic" "cost_alerts" {
+  name              = "cost-alerts"
+  display_name      = "Cost Anomaly Alerts"
+  kms_master_key_id = aws_kms_key.sns_encryption.id
+}
+
+resource "aws_sns_topic_subscription" "cost_alerts_email" {
+  topic_arn = aws_sns_topic.cost_alerts.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+resource "aws_sns_topic_subscription" "cost_alerts_slack" {
+  topic_arn = aws_sns_topic.cost_alerts.arn
+  protocol  = "lambda"
+  endpoint  = aws_lambda_function.slack_notifier.arn
+}
+
+# KMS key for SNS encryption
+resource "aws_kms_key" "sns_encryption" {
+  description             = "KMS key for SNS topic encryption"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+}
